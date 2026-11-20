@@ -1,0 +1,6 @@
+streamlit>=1.38
+cryptography>=43.0
+bcrypt>=4.2
+Pillow>=10.4
+numpy>=1.26
+opencv-contrib-python>=4.10
