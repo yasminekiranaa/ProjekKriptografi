@@ -48,7 +48,7 @@ Untuk produksi, gunakan FIDO2/security key atau smartcard dengan kunci non-expor
 
 ## Menjalankan
 ```bash
-python -m streamlit run app.
+python -m streamlit run app.py
 ```
 Buka alamat lokal yang ditampilkan Streamlit.
 
