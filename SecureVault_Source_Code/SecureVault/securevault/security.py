@@ -1,8 +1,10 @@
-import os, json, hashlib, secrets, base64, string, ctypes
+import os, json, hashlib, secrets, base64, string
 from pathlib import Path
 import bcrypt
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.fernet import Fernet
+
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
@@ -16,23 +18,14 @@ def verify_password(password: str, stored_hash: str) -> bool:
 def derive_key(password: str, salt: bytes) -> bytes:
     return Scrypt(salt=salt, length=32, n=2**14, r=8, p=1).derive(password.encode())
 
-def _usb_roots_windows():
-    # Hanya drive removable (flashdisk); drive fixed seperti C:\ diabaikan.
-    for letter in string.ascii_uppercase:
-        root = f"{letter}:\\"
-        if ctypes.windll.kernel32.GetDriveTypeW(root) == 2:  # 2 = DRIVE_REMOVABLE
-            yield Path(root)
-
-def _volume_serial(root: Path) -> str:
-    serial = ctypes.c_uint32()
-    ok = ctypes.windll.kernel32.GetVolumeInformationW(
-        str(root), None, 0, ctypes.byref(serial), None, None, None, 0)
-    return f"{serial.value:08X}" if ok else ""
-
 def dongle_candidates():
+    # Search common mounted volumes; no arbitrary filesystem-wide scan.
     roots = []
     if os.name == "nt":
-        roots = list(_usb_roots_windows())
+        for letter in string.ascii_uppercase:
+            p = Path(f"{letter}:/")
+            if p.exists():
+                roots.append(p)
     else:
         for parent in (Path("/media"), Path("/mnt"), Path("/run/media")):
             if parent.exists():
@@ -47,9 +40,7 @@ def dongle_candidates():
             try:
                 obj = json.loads(f.read_text(encoding="utf-8"))
                 if obj.get("app") == "SecureVault" and obj.get("token"):
-                    # Token diikat ke serial number flashdisk: salinan dongle.json di flashdisk lain tidak valid.
-                    serial = _volume_serial(root) if os.name == "nt" else ""
-                    yield str(f), f'{obj["token"]}|{serial}'
+                    yield str(f), obj["token"]
             except Exception:
                 continue
 
@@ -100,7 +91,7 @@ def vigenere_decrypt(text: str, key: str) -> str:
 def encrypt_text(plaintext: str, password: str):
     salt = os.urandom(16)
     aes_key = derive_key(password, salt)
-    vig_key = "".join(secrets.choice(string.ascii_uppercase) for _ in range(16))
+    vig_key = secrets.token_hex(8).upper()
     classical = vigenere_encrypt(plaintext, vig_key)
     package = json.dumps({"vigenere": classical, "key": vig_key},
                          ensure_ascii=False).encode("utf-8")
@@ -113,13 +104,30 @@ def decrypt_text(salt: bytes, nonce: bytes, ciphertext: bytes, password: str):
                                          b"SecureVault-text-v1").decode("utf-8"))
     return vigenere_decrypt(package["vigenere"], package["key"])
 
-def encrypt_file(data: bytes, password: str):
-    salt = os.urandom(16)
-    key = derive_key(password, salt)
-    nonce = os.urandom(12)
-    ciphertext = ChaCha20Poly1305(key).encrypt(nonce, data, b"SecureVault-file-v1")
-    return salt, nonce, ciphertext
+def encrypt_file(file_bytes: bytes, password: str) -> bytes:
+    if isinstance(file_bytes, tuple):
+        file_bytes = file_bytes[0]
+    if not isinstance(file_bytes, (bytes, bytearray)):
+        file_bytes = bytes(file_bytes)
 
-def decrypt_file(salt: bytes, nonce: bytes, ciphertext: bytes, password: str):
-    key = derive_key(password, salt)
-    return ChaCha20Poly1305(key).decrypt(nonce, ciphertext, b"SecureVault-file-v1")
+    salt = os.urandom(16)
+    raw_key = derive_key(password, salt)
+    fernet_key = base64.urlsafe_b64encode(raw_key)
+    fernet = Fernet(fernet_key)
+    ciphertext = fernet.encrypt(bytes(file_bytes))
+    return b"SVFILE1" + salt + ciphertext
+
+def decrypt_file(encrypted_bytes: bytes, password: str) -> bytes:
+    if isinstance(encrypted_bytes, tuple):
+        encrypted_bytes = encrypted_bytes[0]
+    if not isinstance(encrypted_bytes, (bytes, bytearray)):
+        encrypted_bytes = bytes(encrypted_bytes)
+
+    if not encrypted_bytes.startswith(b"SVFILE1") or len(encrypted_bytes) < 23:
+        raise ValueError("Format file SecureVault tidak valid.")
+    salt = encrypted_bytes[7:23]
+    ciphertext = encrypted_bytes[23:]
+    raw_key = derive_key(password, salt)
+    fernet_key = base64.urlsafe_b64encode(raw_key)
+    fernet = Fernet(fernet_key)
+    return fernet.decrypt(ciphertext)
